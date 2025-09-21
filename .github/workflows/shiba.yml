@@ -1,0 +1,202 @@
+name: Build Pixel 8 Kernel with KernelSU
+
+on:
+  workflow_dispatch:  # 允许手动触发
+  push:
+    tags:
+      - 'v*'  # 当推送版本标签时触发
+  schedule:
+    - cron: '0 0 * * 0'  # 每周日午夜运行一次（可选）
+
+env:
+  KERNEL_DIR: android_kernel_google_zuma
+  DEFCONFIG: shiba_defconfig
+  ARCH: arm64
+  THREADS: 4  # GitHub 免费版提供 2 核 CPU，设置 4 线程以充分利用
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180  # 编译内核可能需要较长时间
+
+    steps:
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+      with:
+        repository: kerneltoast/android_kernel_google_zuma
+        ref: 16.0.0-sultan  # 使用你指定的分支
+        path: ${{ env.KERNEL_DIR }}
+
+    - name: Set up build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          libncurses-dev \
+          libssl-dev \
+          bc \
+          flex \
+          bison \
+          libelf-dev \
+          git \
+          ccache \
+          python3 \
+          rsync \
+          kmod \
+          cpio \
+          libxml2-dev \
+          libxslt-dev \
+          device-tree-compiler
+
+    - name: Set up Clang toolchain
+      run: |
+        # 创建工具链目录
+        mkdir -p toolchains/clang
+        # 下载预编译的 Clang (使用 Google 的 Clang 版本)
+        wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487747c.tar.gz
+        tar -xzf clang-r487747c.tar.gz -C toolchains/clang/
+        rm clang-r487747c.tar.gz
+
+    - name: Set up GCC toolchain
+      run: |
+        mkdir -p toolchains/gcc
+        # 下载 AArch64 交叉编译工具链
+        git clone --depth=1 https://github.com/lineageos/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git toolchains/gcc
+
+    - name: Clone and setup KernelSU
+      run: |
+        cd ${{ env.KERNEL_DIR }}
+        git clone https://github.com/tiann/KernelSU.git
+        cd KernelSU
+        # 切换到稳定版本
+        git checkout v0.9.3
+        cd ..
+        # 应用 KernelSU 补丁
+        bash KernelSU/kernel_patch/patch.sh KernelSU/
+
+    - name: Set up environment variables
+      run: |
+        echo "CLANG_PATH=$(pwd)/toolchains/clang/bin" >> $GITHUB_ENV
+        echo "GCC_PATH=$(pwd)/toolchains/gcc/bin" >> $GITHUB_ENV
+        echo "PATH=$(pwd)/toolchains/clang/bin:$(pwd)/toolchains/gcc/bin:$PATH" >> $GITHUB_ENV
+        echo "CC=clang" >> $GITHUB_ENV
+        echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
+        echo "CROSS_COMPILE=aarch64-linux-android-" >> $GITHUB_ENV
+        echo "ARCH=${{ env.ARCH }}" >> $GITHUB_ENV
+
+    - name: Configure kernel
+      run: |
+        cd ${{ env.KERNEL_DIR }}
+        # 应用默认配置
+        make ${{ env.DEFCONFIG }}
+        # 启用 KernelSU 所需选项
+        ./scripts/config --enable CONFIG_KPROBES \
+                        --enable CONFIG_HAVE_KPROBES \
+                        --enable CONFIG_KPROBE_EVENTS \
+                        --enable CONFIG_OVERLAY_FS \
+                        --enable CONFIG_MODULES \
+                        --enable CONFIG_MODULE_UNLOAD
+        # 启用 KernelSU
+        echo "CONFIG_KSU=y" >> .config
+        echo "CONFIG_KSU_DEBUG=n" >> .config
+        echo "CONFIG_KSU_EXPECTED_SIZE=0" >> .config
+        echo "CONFIG_KSU_WHITELIST=n" >> .config
+        # 更新配置
+        make olddefconfig
+
+    - name: Build kernel
+      run: |
+        cd ${{ env.KERNEL_DIR }}
+        # 使用 ccache 加速编译
+        make -j${{ env.THREADS }} CC="ccache clang" LD=ld.lld 2>&1 | tee build.log
+        # 检查编译是否成功
+        if [ ! -f "arch/arm64/boot/Image.gz" ]; then
+          echo "编译失败，查看日志:"
+          tail -50 build.log
+          exit 1
+        fi
+
+    - name: Prepare AnyKernel3 template
+      run: |
+        git clone https://github.com/osm0sis/AnyKernel3.git
+        # 为 Pixel 8 配置 AnyKernel3
+        cat > AnyKernel3/anykernel.sh << 'EOF'
+#!/system/bin/sh
+# AnyKernel3 Ramdisk Mod Script
+# osm0sis @ xda-developers
+
+## AnyKernel setup
+# begin properties
+properties() { '
+kernel.string=KernelSU for Pixel 8
+do.devicecheck=1
+do.modules=0
+do.systemless=1
+do.cleanup=1
+do.cleanuponabort=0
+device.name1=shiba
+device.name2=husky
+supported.versions=14
+supported.patchlevels=
+'; } # end properties
+
+# shell variables
+block=/dev/block/bootdevice/by-name/init_boot;
+is_slot_device=1;
+ramdisk_compression=auto;
+
+## AnyKernel methods (DO NOT CHANGE)
+# import patching functions/variables - see for reference
+. tools/ak3-core.sh;
+
+## AnyKernel install
+dump_boot;
+
+# Begin Ramdisk Changes
+
+# End Ramdisk Changes
+
+write_boot;
+## end install
+EOF
+
+    - name: Create flashable ZIP
+      run: |
+        # 复制内核文件到 AnyKernel3
+        cp ${{ env.KERNEL_DIR }}/arch/arm64/boot/Image.gz AnyKernel3/
+        # 复制设备树文件（如果存在）
+        if [ -d "${{ env.KERNEL_DIR }}/arch/arm64/boot/dts/google" ]; then
+          cp ${{ env.KERNEL_DIR }}/arch/arm64/boot/dts/google/*.dtb AnyKernel3/ 2>/dev/null || true
+        fi
+        # 创建 ZIP 包
+        cd AnyKernel3
+        zip -r9 ../kernel-shiba-ksu.zip * -x .git*
+        cd ..
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-build-artifacts
+        path: |
+          ${{ env.KERNEL_DIR }}/arch/arm64/boot/Image.gz
+          ${{ env.KERNEL_DIR }}/arch/arm64/boot/Image.gz-dtb
+          kernel-shiba-ksu.zip
+          ${{ env.KERNEL_DIR }}/build.log
+
+    - name: Create GitHub Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          kernel-shiba-ksu.zip
+        body: |
+          # KernelSU 内核构建
+          自动为 Pixel 8 (shiba) 构建的内核，集成了 KernelSU。
+          - 内核版本: ${{ github.ref_name }}
+          - 构建时间: ${{ github.run_number }}
+          - 包含 KernelSU: v0.9.3
+          
+          刷入方法:
+          1. 下载 `kernel-shiba-ksu.zip`
+          2. 通过自定义 Recovery (如 TWRP) 刷入
+          3. 安装 [KernelSU Manager App](https://github.com/tiann/KernelSU/releases)
